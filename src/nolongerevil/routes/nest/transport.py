@@ -865,10 +865,12 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    # Parse body supporting both formats (objects array or bucket-keyed)
+    # Parse body supporting all known formats (objects array, bucket-keyed, v3 nested)
     _session, objects = parse_put_body(body)
     if not isinstance(objects, list):
         return web.Response(text="Invalid request: objects array required", status=400)
+
+    is_v3 = request.match_info.get("version") == "v3"
 
     state_service: DeviceStateService = request.app["state_service"]
 
@@ -958,17 +960,39 @@ async def handle_transport_put(request: web.Request) -> web.Response:
         )
         await state_service.upsert_object(new_obj)
 
-        # Build response — rev/ts/key only, no value echo.
-        # The device already knows what it sent, and the subscribe channel
-        # handles server→device pushes.  Echoing the full merged bucket here
-        # caused stale target_temperature from the server's stored state to
-        # overwrite the device's schedule-derived setpoint (race between
-        # HVAC-state PUT and SetTargetTemperature on the device side).
+        # Build response — rev/ts/key only on v7, plus value-echo +
+        # $version/$timestamp on v3.
+        #
+        # On v7, echoing the full merged bucket caused stale
+        # target_temperature from the server's stored state to overwrite the
+        # device's schedule-derived setpoint (race between HVAC-state PUT
+        # and SetTargetTemperature on the device side). On v3 (firmware
+        # 4.3.3 / Display-2.14), the device-side parser doesn't apply the
+        # response at all unless `value` is present on a changed bucket,
+        # so the race the v7 omission was avoiding can't fire here.
+        #
+        # `$version` / `$timestamp` are load-bearing for v3 bootstrap. The
+        # firmware's bucket synchroniser (FUN_00069be8 in 4.3.3) literally
+        # `strstr`-searches PUT responses for those two substrings and
+        # only marks the bucket clean (IsDirty=0) when both are present
+        # and match the version/timestamp the device just PUT. Without
+        # them, every PUT keeps the bucket dirty, the subscribe Gate A
+        # (`!IsDirty()`) never opens, the device never issues a
+        # subscribe, and the bucket-store stays empty for
+        # device.<serial> / shared.<serial>. On subsequent PUTs the
+        # parser then rejects responses with "no bucket exists for
+        # payload" because the store has no entry to apply the delta to.
+        # The system can't bootstrap out of this without the echo.
         response_obj: dict[str, Any] = {
             "object_revision": new_obj.object_revision,
             "object_timestamp": new_obj.object_timestamp,
             "object_key": new_obj.object_key,
         }
+        if is_v3:
+            response_obj["$version"] = new_obj.object_revision
+            response_obj["$timestamp"] = new_obj.object_timestamp
+            if values_changed:
+                response_obj["value"] = new_obj.value
 
         response_objects.append(response_obj)
 
@@ -993,10 +1017,51 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     # path already handles pushing newer server data via timestamp comparison,
     # which is the correct mechanism.  Removed 2026-02-09.
 
+    if is_v3:
+        return web.json_response(
+            _wrap_in_v3_envelope(response_objects),
+            headers=_make_response_headers(),
+        )
     return web.json_response(
         {"objects": response_objects},
         headers=_make_response_headers(),
     )
+
+
+def _wrap_in_v3_envelope(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap PUT response objects into the v3 flat envelope:
+    {"<bucket_type>.<serial>": {"$version": N, "$timestamp": T, "value"?: {…}},
+     ...}
+
+    Top-level keys MUST be the full `<bucket_type>.<serial>` string because
+    the device's bucket-store hashtable (storage+0x980, populated at boot by
+    FUN_0003d1d4) is keyed by that exact string. nlclient looks up the
+    bucket via PL_HashTableLookup (FUN_00044814 / nlCZStorage::GetBucket) on
+    the top-level response key. If the top-level key isn't `<type>.<serial>`,
+    the lookup misses and the parser logs
+    `"nlCZUpdateParser: no bucket exists for payload …"` — the device's
+    bucket stays dirty, the subscribe gate never opens, and the device gets
+    stuck in a PUT-retry loop forever.
+
+    Each inner object must include literal `$version` and `$timestamp`
+    fields; nlclient's synchroniser FUN_00069be8 uses raw strstr (not a JSON
+    parser) to extract them. value is included when the bucket changed
+    (other top-level keys inside the bucket object are passed through to
+    bucket->vtable[+0x34] and ignored if not recognised).
+    """
+    envelope: dict[str, dict[str, Any]] = {}
+    for obj in objects:
+        key = obj.get("object_key", "")
+        if "." not in key:
+            continue
+        inner: dict[str, Any] = {
+            "$version": obj.get("object_revision"),
+            "$timestamp": obj.get("object_timestamp"),
+        }
+        if "value" in obj:
+            inner["value"] = obj["value"]
+        envelope[key] = inner
+    return envelope
 
 
 def _values_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
