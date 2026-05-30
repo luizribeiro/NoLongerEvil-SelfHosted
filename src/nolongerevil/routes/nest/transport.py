@@ -75,6 +75,12 @@ logger = get_logger(__name__)
 # have reset while the cached timestamp persists in flash.
 _structure_sent: set[str] = set()
 
+# For v3-firmware subscribes (no per-key timestamps): tracks which
+# (serial, object_key) pairs have been pushed in this server session, so
+# the first contact pushes (to populate the device's bucket-store) and
+# subsequent contacts hold the long-poll.
+_v3_pushed: dict[str, set[str]] = {}
+
 # After sending the first chunk on a subscribe connection, wait this long for
 # additional data before closing.  Must be under the device's 5-second
 # inter-chunk timeout so the connection never idles out on the device side.
@@ -542,8 +548,30 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
 
     for i, client_obj in enumerate(processed_client_objects):
         response_obj = response_objects[i]
-        client_timestamp = client_obj.get("object_timestamp", 0)
         object_key = client_obj.get("object_key", "")
+        # v3-firmware devices subscribe without explicit revs/timestamps
+        # (`{"keys": [{"key": "..."}, ...]}`).
+        # - First contact for this (serial, key) in the server session:
+        #   default client_timestamp to 0 so the server pushes the current
+        #   bucket. The device needs this push to populate its bucket-store
+        #   for the key; without it, nlCZUpdateParser later rejects PUT
+        #   responses for that bucket with "no bucket exists for payload".
+        # - Subsequent contacts: treat the absent timestamp as "client
+        #   claims sync with whatever the server currently has" so the
+        #   long-poll holds open until a real server-side advancement.
+        # v7 devices that explicitly send object_timestamp:0 (fresh
+        # subscribe for a never-seen key) still get the existing
+        # push-from-zero behavior — the distinction is between "field
+        # absent" and "field present with value 0".
+        if "object_timestamp" in client_obj:
+            client_timestamp = client_obj.get("object_timestamp", 0)
+        else:
+            pushed = _v3_pushed.setdefault(serial, set())
+            if object_key in pushed:
+                client_timestamp = response_obj.object_timestamp
+            else:
+                pushed.add(object_key)
+                client_timestamp = 0
 
         # Use timestamp-only comparison (no revision tiebreaker)
         server_newer = _is_server_newer(

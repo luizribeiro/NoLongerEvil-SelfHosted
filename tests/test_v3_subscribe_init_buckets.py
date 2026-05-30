@@ -165,3 +165,68 @@ async def test_v3_subscribe_does_not_push_user_or_structure(
 
     assert not any(k.startswith("user.") for k in keys), keys
     assert not any(k.startswith("structure.") for k in keys), keys
+
+
+@pytest.mark.asyncio
+async def test_v3_subscribe_first_contact_pushes_then_holds(
+    state_service: DeviceStateService,
+    sqlmodel_service: SQLModelService,
+    subscription_manager: SubscriptionManager,
+) -> None:
+    """v3 subscribe `keys` carry no timestamps. On the first contact for
+    each (serial, key) the server must push the bucket so the device
+    populates its bucket-store — without this, nlCZUpdateParser later
+    rejects PUT responses for the bucket with "no bucket exists for
+    payload". After the first push, subsequent v3 subscribes with the
+    same keys must hold the long-poll.
+
+    Pre-fix: missing object_timestamp defaulted to 0, server_ts > 0 fired
+    the "server newer" branch, and the response closed immediately on
+    every subscribe — no long-poll ever held.
+
+    Naive fix (treat absent as "synced"): nothing ever pushed, so the
+    device's bucket-store stayed empty for device/shared and PUT
+    responses got rejected forever.
+    """
+    # Reset the per-session push tracker so this test is isolated from
+    # any other test that exercised the same serial earlier in the run.
+    import nolongerevil.routes.nest.transport as transport_mod
+
+    transport_mod._v3_pushed.pop(SERIAL, None)
+
+    await _make_paired_device(sqlmodel_service)
+    now_ts = int(time.time() * 1000)
+    await state_service.upsert_object(
+        DeviceObject(
+            serial=SERIAL,
+            object_key=f"device.{SERIAL}",
+            object_revision=10,
+            object_timestamp=now_ts,
+            value={"away": False},
+            updated_at=datetime.now(),
+        )
+    )
+    await state_service.upsert_object(
+        DeviceObject(
+            serial=SERIAL,
+            object_key=f"shared.{SERIAL}",
+            object_revision=20,
+            object_timestamp=now_ts,
+            value={"target_temperature": 21.5},
+            updated_at=datetime.now(),
+        )
+    )
+
+    body = {"keys": [{"key": f"device.{SERIAL}"}, {"key": f"shared.{SERIAL}"}]}
+
+    # First contact — both buckets must be pushed.
+    first = await _immediate_response_keys(
+        state_service, sqlmodel_service, subscription_manager, body
+    )
+    assert sorted(first) == sorted([f"device.{SERIAL}", f"shared.{SERIAL}"]), first
+
+    # Second contact — long-poll holds (no immediate body).
+    second = await _immediate_response_keys(
+        state_service, sqlmodel_service, subscription_manager, body
+    )
+    assert second == [], f"expected long-poll hold (empty body), got {second}"
