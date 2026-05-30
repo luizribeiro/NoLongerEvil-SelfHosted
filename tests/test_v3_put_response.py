@@ -87,21 +87,35 @@ async def test_v3_put_response_is_flat_envelope_keyed_by_bucket_id(
 
 
 @pytest.mark.asyncio
-async def test_v3_put_response_includes_dollar_version_and_timestamp(
+async def test_v3_put_response_contains_dollar_version_and_timestamp_substrings(
     state_service: DeviceStateService,
 ) -> None:
-    """The firmware's bucket synchroniser does literal strstr() searches
-    for `$version` and `$timestamp` substrings to mark a bucket clean.
-    Without them, every PUT keeps the bucket dirty, subscribe never arms,
-    and the device deadlocks. Echo them on every v3 PUT response."""
+    """The firmware's bucket synchroniser (FUN_00069be8) does literal strstr()
+    searches for `"$version":` and `"$timestamp":` substrings inside the
+    per-bucket value object. They can be at ANY nesting depth — strstr is
+    byte-scan, not JSON-aware. The current envelope nests them inside a
+    `_sync` wrapper so the node-walker (FUN_00068068) doesn't see them as
+    top-level keys (which would trigger the bucket-key-append corruption
+    via FUN_0004f460). The strstr arm still finds them, so the subscribe
+    gate still arms."""
     body = await _put(
         state_service,
         {"shared": {SERIAL: {"target_temperature": 21.5}}},
         version="v3",
     )
     inner = body[f"shared.{SERIAL}"]
-    assert "$version" in inner, inner
-    assert "$timestamp" in inner, inner
+    # The corruption-avoidance rule: $version/$timestamp must NOT be
+    # top-level keys of the per-bucket value object. Test both halves:
+    assert "$version" not in inner, (
+        "$version as a top-level key triggers the firmware's bucket+0x2c "
+        f"append corruption: {inner}"
+    )
+    assert "$timestamp" not in inner, inner
+    # But the strstr arm needs to find the literal substrings somewhere
+    # in the serialised per-bucket value JSON.
+    serialised = json.dumps(inner)
+    assert '"$version":' in serialised, serialised
+    assert '"$timestamp":' in serialised, serialised
 
 
 @pytest.mark.asyncio
