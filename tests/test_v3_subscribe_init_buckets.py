@@ -60,7 +60,9 @@ def _make_request(
         "subscription_manager": subscription_manager,
         "storage": sqlmodel_service,
     }
-    req.match_info = {}
+    # These tests exercise v3 firmware behavior; real v3 subscribes hit
+    # /nest/transport/v3/subscribe, so the push path must use the v3 (SKV) form.
+    req.match_info = {"version": "v3"}
     return req
 
 
@@ -106,15 +108,17 @@ async def _immediate_response_keys(
     subscription_manager: SubscriptionManager,
     body: dict,
 ) -> list[str]:
-    """Run handle_transport_subscribe and return object_keys in the immediate
-    body, or [] if the handler held the long-poll (no body written)."""
+    """Run handle_transport_subscribe and return the object_keys pushed
+    immediately, or [] if the handler held the long-poll. v3 pushes one bucket
+    per response with its key in the X-nl-skv-key header; v7 uses an
+    {"objects":[...]} body."""
     req = _make_request(state_service, sqlmodel_service, subscription_manager, body)
     written = bytearray()
 
     class StubResponse:
-        def __init__(self) -> None:
+        def __init__(self, headers: dict | None = None) -> None:
             self.status = 200
-            self.headers: dict[str, str] = {}
+            self.headers: dict[str, str] = dict(headers or {})
 
         async def prepare(self, _req: Mock) -> None:
             pass
@@ -128,20 +132,24 @@ async def _immediate_response_keys(
     import nolongerevil.routes.nest.transport as transport_mod
 
     original = transport_mod.web.StreamResponse
-    transport_mod.web.StreamResponse = lambda **_kw: StubResponse()  # type: ignore[assignment]
+    transport_mod.web.StreamResponse = lambda **kw: StubResponse(kw.get("headers"))  # type: ignore[assignment]
     try:
-        await handle_transport_subscribe(req)
+        resp = await handle_transport_subscribe(req)
     finally:
         transport_mod.web.StreamResponse = original
 
-    if not written:
-        return []
     import json
 
-    try:
-        return [obj["object_key"] for obj in json.loads(written).get("objects", [])]
-    except json.JSONDecodeError:
-        return []
+    keys: list[str] = []
+    skv_key = resp.headers.get("X-nl-skv-key")
+    if skv_key:
+        keys.append(skv_key)
+    if written:
+        try:
+            keys += [obj["object_key"] for obj in json.loads(written).get("objects", [])]
+        except json.JSONDecodeError:
+            pass
+    return keys
 
 
 @pytest.mark.asyncio
@@ -219,14 +227,21 @@ async def test_v3_subscribe_first_contact_pushes_then_holds(
 
     body = {"keys": [{"key": f"device.{SERIAL}"}, {"key": f"shared.{SERIAL}"}]}
 
-    # First contact — both buckets must be pushed.
-    first = await _immediate_response_keys(
-        state_service, sqlmodel_service, subscription_manager, body
-    )
-    assert sorted(first) == sorted([f"device.{SERIAL}", f"shared.{SERIAL}"]), first
+    # v3 pushes one bucket per response (SKV header carries the key) and the
+    # device resubscribes after each. Drain until the long-poll holds; both
+    # buckets must be pushed across the cycles.
+    pushed: list[str] = []
+    for _ in range(5):
+        keys = await _immediate_response_keys(
+            state_service, sqlmodel_service, subscription_manager, body
+        )
+        if not keys:
+            break
+        pushed += keys
+    assert sorted(set(pushed)) == sorted([f"device.{SERIAL}", f"shared.{SERIAL}"]), pushed
 
-    # Second contact — long-poll holds (no immediate body).
-    second = await _immediate_response_keys(
+    # Once both are pushed, subsequent subscribes hold the long-poll.
+    held = await _immediate_response_keys(
         state_service, sqlmodel_service, subscription_manager, body
     )
-    assert second == [], f"expected long-poll hold (empty body), got {second}"
+    assert held == [], f"expected long-poll hold (empty body), got {held}"

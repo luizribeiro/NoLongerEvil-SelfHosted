@@ -76,11 +76,13 @@ logger = get_logger(__name__)
 # have reset while the cached timestamp persists in flash.
 _structure_sent: set[str] = set()
 
-# For v3-firmware subscribes (no per-key timestamps): tracks which
-# (serial, object_key) pairs have been pushed in this server session, so
-# the first contact pushes (to populate the device's bucket-store) and
-# subsequent contacts hold the long-poll.
-_v3_pushed: dict[str, set[str]] = {}
+# For v3-firmware subscribes (no per-key timestamps): serial -> {object_key:
+# last_pushed_object_timestamp}. v3 subscribes carry no timestamps, so we
+# compare each bucket's current server timestamp against the last one we pushed
+# for that key: first contact (absent → 0) pushes to populate the device's
+# bucket-store; a bucket whose server timestamp later advances re-detects as
+# outdated and is re-pushed; a quiescent bucket holds the long-poll.
+_v3_pushed: dict[str, dict[str, int]] = {}
 
 # After sending the first chunk on a subscribe connection, wait this long for
 # additional data before closing.  Must be under the device's 5-second
@@ -576,28 +578,18 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
         response_obj = response_objects[i]
         object_key = client_obj.get("object_key", "")
         # v3-firmware devices subscribe without explicit revs/timestamps
-        # (`{"keys": [{"key": "..."}, ...]}`).
-        # - First contact for this (serial, key) in the server session:
-        #   default client_timestamp to 0 so the server pushes the current
-        #   bucket. The device needs this push to populate its bucket-store
-        #   for the key; without it, nlCZUpdateParser later rejects PUT
-        #   responses for that bucket with "no bucket exists for payload".
-        # - Subsequent contacts: treat the absent timestamp as "client
-        #   claims sync with whatever the server currently has" so the
-        #   long-poll holds open until a real server-side advancement.
-        # v7 devices that explicitly send object_timestamp:0 (fresh
-        # subscribe for a never-seen key) still get the existing
-        # push-from-zero behavior — the distinction is between "field
-        # absent" and "field present with value 0".
+        # (`{"keys": [{"key": "..."}, ...]}`). Compare the bucket's server
+        # timestamp against the last one we pushed for this key: absent (first
+        # contact) → 0 → push (populates the device's bucket-store, else
+        # nlCZUpdateParser later rejects PUT responses with "no bucket exists
+        # for payload"); a later server-side advancement re-detects as outdated
+        # and re-pushes; otherwise the long-poll holds. v7 devices that send an
+        # explicit object_timestamp keep timestamp-authority behavior — the
+        # distinction is "field absent" vs "field present".
         if "object_timestamp" in client_obj:
             client_timestamp = client_obj.get("object_timestamp", 0)
         else:
-            pushed = _v3_pushed.setdefault(serial, set())
-            if object_key in pushed:
-                client_timestamp = response_obj.object_timestamp
-            else:
-                pushed.add(object_key)
-                client_timestamp = 0
+            client_timestamp = _v3_pushed.setdefault(serial, {}).get(object_key, 0)
 
         # Use timestamp-only comparison (no revision tiebreaker)
         server_newer = _is_server_newer(
@@ -820,6 +812,9 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
         logger.debug(
             f"SKV push {skv_push.object_key} v{skv_push.object_revision} to {serial}"
         )
+        # Record what we pushed so this bucket isn't re-pushed until it changes
+        # again (server timestamp advances past this).
+        _v3_pushed.setdefault(serial, {})[skv_push.object_key] = skv_push.object_timestamp
         await response.write(json.dumps(skv_push.value).encode("utf-8"))
         await response.write_eof()
         return response
