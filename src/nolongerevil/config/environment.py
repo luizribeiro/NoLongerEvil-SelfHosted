@@ -71,6 +71,15 @@ class Settings(BaseSettings):
         "Must not exceed ~350s due to WiFi keepalive probe timeout constraints. "
         "Recommended: 300 seconds.",
     )
+    connection_hold_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=345,
+        description="Override how long (seconds) to hold a chunked subscribe open before "
+        "closing it to drive the resubscribe cycle. Lower = faster worst-case cloud->device "
+        "push latency, but more frequent reconnects. Unset = suspend_time_max - 10. "
+        "Must stay below suspend_time_max and ~350s.",
+    )
     defer_device_window: int = Field(
         default=15,
         ge=0,
@@ -179,7 +188,12 @@ class Settings(BaseSettings):
         - suspend_time_max (so the server closes before the safety-net timer)
         - ~350s (WiFi keepalive probe timeout — exceeding this causes overlapping
           subscriptions as the device resubscribes without closing the old connection)
+
+        Defaults to suspend_time_max - 10; override via
+        CONNECTION_HOLD_TIMEOUT_SECONDS to tune push latency vs reconnect rate.
         """
+        if self.connection_hold_timeout_seconds is not None:
+            return float(self.connection_hold_timeout_seconds)
         return float(self.suspend_time_max - 10)
 
     @property
