@@ -1117,18 +1117,68 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     # which is the correct mechanism.  Removed 2026-02-09.
 
     if is_v3:
-        # A v3 PUT response that carries the bucket as a JSON map key with child
-        # fields corrupts the device's composite key (the parser appends a
-        # fragment → the next BigGet GET URL gains a space → HTTP 400 → the
-        # device backs off /nest/transport). Version/timestamp reach the device
-        # over the corruption-free BigGet path, and the subscribe gate stays
-        # open via CompareVersions, so the PUT only needs a parse-safe no-op
-        # body. See ~/nest-re/notes/subscribe-push-framing.md.
-        return web.json_response({}, headers=_make_response_headers())
+        return web.json_response(
+            _wrap_in_v3_envelope(response_objects),
+            headers=_make_response_headers(),
+        )
     return web.json_response(
         {"objects": response_objects},
         headers=_make_response_headers(),
     )
+
+
+def _wrap_in_v3_envelope(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap PUT response objects into the v3 flat envelope.
+
+    Shape: `{"<bucket_type>.<serial>": {"_sync": {"$version": N,
+                                                   "$timestamp": T},
+                                         "value"?: {…}}, ...}`.
+
+    Top-level keys MUST be the full `<bucket_type>.<serial>` string because
+    the device's bucket-store hashtable (storage+0x980, populated at boot by
+    FUN_0003d1d4) is keyed by that exact string. nlclient looks up the
+    bucket via PL_HashTableLookup (FUN_00044814 / nlCZStorage::GetBucket) on
+    the top-level response key. A wrong top-level key misses the lookup and
+    the parser logs `"nlCZUpdateParser: no bucket exists for payload …"`,
+    leaving the bucket dirty and the subscribe gate shut forever.
+
+    `$version` and `$timestamp` are placed inside a nested `_sync` wrapper,
+    NOT as top-level fields of the per-bucket value object. The reason:
+
+    - The synchroniser (FUN_00069be8) uses raw `strstr` for the literal
+      substrings `"$version":` and `"$timestamp":` anywhere inside the
+      per-bucket value substring — nesting doesn't hide them from it. It
+      still extracts the version/timestamp and arms the subscribe gate.
+
+    - The node-walking parser (FUN_00068068) that ALSO runs on the per-bucket
+      value object dispatches per top-level child key: `$version`/`$timestamp`
+      at top level hit a switch case inside FUN_00069d30 that calls
+      FUN_0004f460, which APPENDS `" .$version"` to the bucket's composite
+      key string at bucket+0x2c. Every cycle adds another segment. The
+      corrupted key is then re-serialised verbatim into the device's next PUT
+      and subscribe bodies, producing serials like
+      `"02AA01AC2815016L .$version .$version"`. Hiding the `$`-prefixed
+      keys under a non-`$` wrapper means the node-walker only sees `_sync`
+      as a top-level field; non-`$` unknown fields go to vtable+0x2c (the
+      generic setter) and are dropped harmlessly.
+
+    See `~/nest-re/notes/answer-for-nle.md` for the full RE walkthrough.
+    """
+    envelope: dict[str, dict[str, Any]] = {}
+    for obj in objects:
+        key = obj.get("object_key", "")
+        if "." not in key:
+            continue
+        inner: dict[str, Any] = {
+            "_sync": {
+                "$version": obj.get("object_revision"),
+                "$timestamp": obj.get("object_timestamp"),
+            },
+        }
+        if "value" in obj:
+            inner["value"] = obj["value"]
+        envelope[key] = inner
+    return envelope
 
 
 def _values_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:

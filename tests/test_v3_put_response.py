@@ -51,19 +51,20 @@ async def _put(
 
 
 # ---------------------------------------------------------------------------
-# v3 PUT response is a parse-safe no-op
+# v3 envelope shape
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_v3_put_response_is_empty_no_op(
+async def test_v3_put_response_is_flat_envelope_keyed_by_bucket_id(
     state_service: DeviceStateService,
 ) -> None:
-    """Any bucket-keyed v3 PUT response with child fields ($version/$timestamp/
-    _sync/value) corrupts the device's composite key (parser appends a fragment
-    → next BigGet GET URL gains a space → HTTP 400 → device backs off). The PUT
-    must return a parse-safe no-op; version/timestamp sync over the BigGet path
-    and the subscribe gate stays open via CompareVersions."""
+    """Top-level keys MUST be the full `<bucket_type>.<serial>` string, not
+    nested under bucket-type. The device's bucket-store hashtable is keyed
+    by that exact string; nlclient looks the bucket up via PL_HashTableLookup
+    on the top-level response key. A nested envelope (top-level "shared"
+    with inner "<serial>") makes that lookup miss → parser logs "no bucket
+    exists for payload" → device deadlocks in PUT-retry."""
     body = await _put(
         state_service,
         {
@@ -72,12 +73,84 @@ async def test_v3_put_response_is_empty_no_op(
         },
         version="v3",
     )
-    assert body == {}
-    # None of the key-corrupting shapes may appear.
-    serialised = json.dumps(body)
-    assert "$version" not in serialised
-    assert "_sync" not in serialised
-    assert f"shared.{SERIAL}" not in serialised
+    assert "objects" not in body
+    assert f"shared.{SERIAL}" in body
+    assert f"device.{SERIAL}" in body
+    # No bucket-type-only keys
+    assert "shared" not in body
+    assert "device" not in body
+
+
+# ---------------------------------------------------------------------------
+# v3 value echo on change
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_v3_put_response_contains_dollar_version_and_timestamp_substrings(
+    state_service: DeviceStateService,
+) -> None:
+    """The firmware's bucket synchroniser (FUN_00069be8) does literal strstr()
+    searches for `"$version":` and `"$timestamp":` substrings inside the
+    per-bucket value object. They can be at ANY nesting depth — strstr is
+    byte-scan, not JSON-aware. The current envelope nests them inside a
+    `_sync` wrapper so the node-walker (FUN_00068068) doesn't see them as
+    top-level keys (which would trigger the bucket-key-append corruption
+    via FUN_0004f460). The strstr arm still finds them, so the subscribe
+    gate still arms."""
+    body = await _put(
+        state_service,
+        {"shared": {SERIAL: {"target_temperature": 21.5}}},
+        version="v3",
+    )
+    inner = body[f"shared.{SERIAL}"]
+    # The corruption-avoidance rule: $version/$timestamp must NOT be
+    # top-level keys of the per-bucket value object. Test both halves:
+    assert "$version" not in inner, (
+        "$version as a top-level key triggers the firmware's bucket+0x2c "
+        f"append corruption: {inner}"
+    )
+    assert "$timestamp" not in inner, inner
+    # But the strstr arm needs to find the literal substrings somewhere
+    # in the serialised per-bucket value JSON.
+    serialised = json.dumps(inner)
+    assert '"$version":' in serialised, serialised
+    assert '"$timestamp":' in serialised, serialised
+
+
+@pytest.mark.asyncio
+async def test_v3_put_response_echoes_value_on_change(
+    state_service: DeviceStateService,
+) -> None:
+    body = await _put(
+        state_service,
+        {"shared": {SERIAL: {"target_temperature": 21.5}}},
+        version="v3",
+    )
+    inner = body[f"shared.{SERIAL}"]
+    assert "value" in inner
+    assert inner["value"]["target_temperature"] == 21.5
+
+
+@pytest.mark.asyncio
+async def test_v3_put_response_omits_value_on_duplicate_put(
+    state_service: DeviceStateService,
+) -> None:
+    """If the same value is PUT twice, the second response has no `value`
+    field (values_changed=False), even on v3."""
+    first = await _put(
+        state_service,
+        {"shared": {SERIAL: {"target_temperature": 21.5}}},
+        version="v3",
+    )
+    assert "value" in first[f"shared.{SERIAL}"]
+
+    second = await _put(
+        state_service,
+        {"shared": {SERIAL: {"target_temperature": 21.5}}},
+        version="v3",
+    )
+    assert "value" not in second[f"shared.{SERIAL}"]
 
 
 # ---------------------------------------------------------------------------
