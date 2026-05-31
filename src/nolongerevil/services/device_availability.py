@@ -15,7 +15,12 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # Default timeout values (in seconds)
-DEFAULT_DEVICE_TIMEOUT = 300  # 5 minutes
+# Must exceed the subscribe long-poll cycle: the device holds ~290s
+# (connection_hold_timeout) then re-subscribes, so its contact interval is
+# ~300-305s. A 300s timeout marks it unavailable right before each re-subscribe
+# (it flaps, esp. on wall power where radio power-save adds wake latency). Use
+# ~2x the hold so a normal cycle — and one missed one — never trips it.
+DEFAULT_DEVICE_TIMEOUT = 600  # 10 minutes (> one long-poll hold cycle)
 DEFAULT_CHECK_INTERVAL = 30  # 30 seconds
 
 
