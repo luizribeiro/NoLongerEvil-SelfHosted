@@ -64,6 +64,7 @@ from nolongerevil.services.device_availability import DeviceAvailability
 from nolongerevil.services.device_state_service import DeviceStateService
 from nolongerevil.services.sqlmodel_service import SQLModelService
 from nolongerevil.services.subscription_manager import SubscriptionManager
+from nolongerevil.utils.bucket_key import canonical_object_key
 from nolongerevil.utils.fan_timer import preserve_fan_timer_state
 from nolongerevil.utils.structure_assignment import assign_structure_id, derive_structure_id
 
@@ -303,6 +304,10 @@ async def handle_transport_get(request: web.Request) -> web.Response:
     if not serial:
         return web.json_response({"error": "Serial required"}, status=400)
 
+    # A corrupted composite key bleeds into the request path too
+    # (.../device/device.SERIAL ._sync); resolve to the real serial.
+    serial = canonical_object_key(serial)
+
     state_service: DeviceStateService = request.app["state_service"]
 
     # Ensure device alert dialog exists (matches TypeScript behavior)
@@ -403,6 +408,9 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
 
     # Parse body supporting both formats (named fields or objects array)
     session, chunked, objects = parse_subscribe_body(body)
+    for obj in objects:
+        if obj.get("object_key"):
+            obj["object_key"] = canonical_object_key(obj["object_key"])
     if not session:
         session = f"session_{serial}_{int(time.time() * 1000)}"
     weave_device_id = extract_weave_device_id(request)
@@ -917,6 +925,9 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     _session, objects = parse_put_body(body)
     if not isinstance(objects, list):
         return web.Response(text="Invalid request: objects array required", status=400)
+    for obj in objects:
+        if obj.get("object_key"):
+            obj["object_key"] = canonical_object_key(obj["object_key"])
 
     is_v3 = request.match_info.get("version") == "v3"
 

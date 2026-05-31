@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from nolongerevil.lib.logger import get_logger
 from nolongerevil.lib.types import DeviceObject, DeviceStateChange
+from nolongerevil.utils.bucket_key import is_corrupted_key
 
 if TYPE_CHECKING:
     from nolongerevil.integrations.integration_manager import IntegrationManager
@@ -51,13 +52,24 @@ class DeviceStateService:
         logger.info("Device state service closed")
 
     async def _load_cache(self) -> None:
-        """Load all objects from storage into cache."""
+        """Load all objects from storage into cache.
+
+        Canonical bucket keys never contain spaces; a stored key with a space
+        is a firmware-corruption artifact and is purged rather than cached.
+        """
         objects = await self._storage.get_all_objects()
+        purged = 0
         for obj in objects:
+            if is_corrupted_key(obj.object_key):
+                await self._storage.delete_object(obj.serial, obj.object_key)
+                purged += 1
+                continue
             if obj.serial not in self._cache:
                 self._cache[obj.serial] = {}
             self._cache[obj.serial][obj.object_key] = obj
-        logger.info(f"Loaded {len(objects)} objects into cache")
+        logger.info(f"Loaded {len(objects) - purged} objects into cache")
+        if purged:
+            logger.info(f"Purged {purged} corrupted-key bucket(s) from storage")
 
     def get_object(self, serial: str, object_key: str) -> DeviceObject | None:
         """Get a device object from cache.
