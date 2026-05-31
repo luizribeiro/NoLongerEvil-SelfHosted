@@ -315,26 +315,18 @@ async def handle_transport_get(request: web.Request) -> web.Response:
 
     objects = state_service.get_objects_by_serial(serial)
 
-    # v3 firmware (nlCZGetParser) keys entries by "key" and reads "$version"/
-    # "$timestamp" — the v7 field names don't exist in the v3 binary.
-    if "/transport/v3/" in request.path:
-        response_objects = [
-            {
-                "key": obj.object_key,
-                "$version": obj.object_revision,
-                "$timestamp": obj.object_timestamp,
-            }
-            for obj in objects
-        ]
-    else:
-        response_objects = [
-            {
-                "object_revision": obj.object_revision,
-                "object_timestamp": obj.object_timestamp,
-                "object_key": obj.object_key,
-            }
-            for obj in objects
-        ]
+    # Return only metadata, not values. The v3 firmware's nlCZGetParser faults
+    # on a "key"/"$version"/"$timestamp" shape ("parent object format incorrect
+    # … for $version" → nlclient crash-loop), so serve the same objects-array
+    # metadata shape to all firmware versions.
+    response_objects = [
+        {
+            "object_revision": obj.object_revision,
+            "object_timestamp": obj.object_timestamp,
+            "object_key": obj.object_key,
+        }
+        for obj in objects
+    ]
 
     return web.json_response(
         {"objects": response_objects},

@@ -1,19 +1,17 @@
-"""Tests for the v3-firmware BigGet reply shape at GET /nest/transport/v3/device/...
+"""Regression guard for the v3 device GET (BigGet) reply shape.
 
-v3 firmware parses the BigGet reply with nlCZGetParser, which keys each entry
-by a field literally named "key" and reads "$version"/"$timestamp" off it to
-set the bucket's cloud version/timestamp. The v7 field names
-object_key/object_revision/object_timestamp do not exist in the v3 binary, so
-the v7 shape leaves the bucket's cloud timestamp at 0 and CompareVersions takes
-the "forcing device update" branch — the subscribe gate never opens.
-
-v7/legacy GET paths MUST keep the {"objects": [{object_revision, ...}]} shape.
+An earlier attempt served `{"objects":[{"key","$version","$timestamp"}]}` to v3
+firmware on the theory that nlCZGetParser reads those field names. On real
+hardware that shape faults the parser ("nlCZParser: parent object format
+incorrect: 3 for $version" → "cannot find bucket under key $version") and
+crash-loops nlclient. The GET reply must use the objects-array metadata shape
+(object_revision/object_timestamp/object_key) for every firmware version.
 """
 
 import json
 import time
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 from aiohttp import web
@@ -34,25 +32,14 @@ def _make_get_request(state_service: DeviceStateService, path: str) -> Mock:
     return req
 
 
-async def _seed_buckets(state_service: DeviceStateService) -> None:
-    ts = int(time.time() * 1000)
+async def _seed(state_service: DeviceStateService) -> None:
     await state_service.upsert_object(
         DeviceObject(
             serial=SERIAL,
             object_key=f"device.{SERIAL}",
             object_revision=4,
-            object_timestamp=ts,
+            object_timestamp=int(time.time() * 1000),
             value={"current_temperature": 20.5},
-            updated_at=datetime.now(),
-        )
-    )
-    await state_service.upsert_object(
-        DeviceObject(
-            serial=SERIAL,
-            object_key=f"shared.{SERIAL}",
-            object_revision=2,
-            object_timestamp=ts,
-            value={"target_temperature": 21.5},
             updated_at=datetime.now(),
         )
     )
@@ -64,38 +51,19 @@ async def _get(state_service: DeviceStateService, path: str) -> dict:
     return json.loads(resp.body)
 
 
+@pytest.mark.parametrize("version", ["v3", "v7"])
 @pytest.mark.asyncio
-async def test_v3_get_uses_bigget_key_dollar_fields(
-    state_service: DeviceStateService,
+async def test_get_uses_object_key_shape_never_dollar_fields(
+    state_service: DeviceStateService, version: str
 ) -> None:
-    await _seed_buckets(state_service)
-    body = await _get(state_service, f"/nest/transport/v3/device/device.{SERIAL}")
-
-    entries = {e["key"]: e for e in body["objects"]}
-    assert f"device.{SERIAL}" in entries
-    assert f"shared.{SERIAL}" in entries
-
-    dev = entries[f"device.{SERIAL}"]
-    # The fields nlCZGetParser actually reads: "key", "$version", "$timestamp".
-    assert dev["$version"] == 4
-    assert dev["$timestamp"] > 0
-    # The v7 names must NOT be the carriers on v3 — the firmware ignores them.
-    assert "object_key" not in dev
-    assert "object_revision" not in dev
-    assert "object_timestamp" not in dev
-
-
-@pytest.mark.asyncio
-async def test_legacy_get_still_uses_object_key_shape(
-    state_service: DeviceStateService,
-) -> None:
-    await _seed_buckets(state_service)
-    body = await _get(state_service, f"/nest/transport/v7/device/device.{SERIAL}")
+    await _seed(state_service)
+    body = await _get(state_service, f"/nest/transport/{version}/device/device.{SERIAL}")
 
     obj = body["objects"][0]
     assert "object_key" in obj
     assert "object_revision" in obj
     assert "object_timestamp" in obj
-    # v3 BigGet field names must not leak into the v7 shape.
-    assert "key" not in obj
+    # The shapes that crash v3 nlclient must never be emitted.
     assert "$version" not in obj
+    assert "$timestamp" not in obj
+    assert "key" not in obj

@@ -200,7 +200,7 @@ async def test_get_with_corrupted_path_resolves_to_real_device(
     resp = await handle_transport_get(req)
     assert resp.status == 200
     body = json.loads(resp.body)
-    keys = [o["key"] for o in body["objects"]]
+    keys = [o["object_key"] for o in body["objects"]]
     assert f"device.{SERIAL}" in keys
 
 
