@@ -373,6 +373,21 @@ def _contains_temperature_fields(objects: list[DeviceObject]) -> bool:
     return any(obj.value and any(field in obj.value for field in temp_fields) for obj in objects)
 
 
+def _skv_push_headers(obj: DeviceObject) -> dict[str, str]:
+    """Headers carrying a pushed bucket's identity to v3 firmware.
+
+    The v3 subscribe-response parser (ParseSKVHeaders) reads the object key,
+    version and timestamp from these headers and applies the response body as
+    the bucket's raw value. Without them it logs "bad header data" and drops
+    the push. One object per response; the body is that object's bare value.
+    """
+    return {
+        "X-nl-skv-key": obj.object_key,
+        "X-nl-skv-version": str(obj.object_revision),
+        "X-nl-skv-timestamp": str(obj.object_timestamp),
+    }
+
+
 async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse:
     """Handle POST /nest/transport - subscribe to device updates.
 
@@ -765,6 +780,13 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     # 6. On timeout: close connection without body (no tickle)
     # =========================================================================
 
+    # The X-nl-skv-* headers must be set BEFORE prepare() (headers go out there),
+    # so pick the v3 object to push now. Any remaining outdated objects — and any
+    # outdated object without a value yet — are re-detected and delivered on the
+    # device's next subscribe.
+    is_v3 = request.match_info.get("version") == "v3"
+    skv_push = next((o for o in outdated_objects if o.value), None) if is_v3 else None
+
     # Determine if we should disable defer window (pushing temp changes)
     # Must check BEFORE response.prepare() since headers are sent there
     include_disable_defer = bool(outdated_objects) and _contains_temperature_fields(
@@ -781,6 +803,8 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     }
     if include_disable_defer:
         response_headers["X-nl-disable-defer-window"] = str(settings.disable_defer_window)
+    if skv_push is not None:
+        response_headers.update(_skv_push_headers(skv_push))
 
     response = web.StreamResponse(status=200, headers=response_headers)
 
@@ -791,8 +815,17 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
         f"(disable_defer={include_disable_defer})"
     )
 
-    # If we have outdated objects, send them immediately
-    if outdated_objects:
+    # v3 SKV push: identity is in the headers, body is the bare value.
+    if skv_push is not None:
+        logger.debug(
+            f"SKV push {skv_push.object_key} v{skv_push.object_revision} to {serial}"
+        )
+        await response.write(json.dumps(skv_push.value).encode("utf-8"))
+        await response.write_eof()
+        return response
+
+    # v7 immediate push: {"objects":[...]} body.
+    if not is_v3 and outdated_objects:
         formatted_objs = [format_object_for_response(obj) for obj in outdated_objects]
         logger.debug(f"Sending {len(outdated_objects)} outdated object(s) immediately for {serial}")
         body_data = json.dumps({"objects": formatted_objs}).encode("utf-8")
@@ -829,6 +862,21 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                 notify_queue.get(),
                 timeout=settings.connection_hold_timeout,
             )
+            if is_v3:
+                # The X-nl-skv-* headers the device needs to accept a push were
+                # already sent at prepare() and can't be added now. Tickle-close
+                # so the device resubscribes; the now-server-newer object is then
+                # delivered as an immediate SKV push on that next subscribe.
+                logger.info(
+                    f"Subscription {subscription.id}: update ready for {serial}; "
+                    "tickling for SKV re-push"
+                )
+                changed_objects = None  # discard so the except handler can't buffer it for replay
+                try:
+                    await response.write_eof()
+                except (ConnectionResetError, ConnectionError):
+                    pass
+                return response
             # Real data arrived - send it to wake the device
             body_bytes = json.dumps({"objects": changed_objects}).encode("utf-8")
             await response.write(body_bytes)
