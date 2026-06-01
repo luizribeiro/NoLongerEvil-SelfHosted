@@ -655,9 +655,14 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                     (o for o in processed_client_objects if o.get("object_key") == user_key),
                     None,
                 )
-                client_ts = client_user.get("object_timestamp", 0) if client_user else 0
-
-                if client_ts < user_obj.object_timestamp:
+                # When the client didn't list user.* in its subscribe (v3
+                # firmware never does), skip the push. Init state is
+                # delivered via /entry inline buckets at bootstrap; re-pushing
+                # here would close the long-poll on every cycle (client_ts=0
+                # < server_ts) and produce a busy reconnect loop.
+                if client_user is None:
+                    pass
+                elif client_user.get("object_timestamp", 0) < user_obj.object_timestamp:
                     outdated_objects.append(user_obj)
                     logger.debug(f"Including user bucket {user_key} for paired device {serial}")
 
@@ -689,18 +694,20 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                     (o for o in processed_client_objects if o.get("object_key") == structure_key),
                     None,
                 )
-                client_struct_ts = (
-                    client_structure.get("object_timestamp", 0) if client_structure else 0
-                )
-
-                first_time = serial not in _structure_sent
-                if client_struct_ts < structure_obj.object_timestamp or first_time:
-                    _structure_sent.add(serial)
-                    outdated_objects.append(structure_obj)
-                    logger.debug(
-                        f"Including structure bucket {structure_key} for paired device {serial}"
-                        f"{' (first connect)' if first_time else ''}"
-                    )
+                # See the user-bucket block above: skip push entirely when
+                # the client didn't list structure.* (v3 devices never do).
+                if client_structure is None:
+                    pass
+                else:
+                    client_struct_ts = client_structure.get("object_timestamp", 0)
+                    first_time = serial not in _structure_sent
+                    if client_struct_ts < structure_obj.object_timestamp or first_time:
+                        _structure_sent.add(serial)
+                        outdated_objects.append(structure_obj)
+                        logger.debug(
+                            f"Including structure bucket {structure_key} for paired device {serial}"
+                            f"{' (first connect)' if first_time else ''}"
+                        )
 
     # Include default structure bucket for unclaimed devices (enables away mode)
     if storage:
@@ -719,17 +726,19 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                         ),
                         None,
                     )
-                    client_struct_ts = (
-                        client_structure.get("object_timestamp", 0) if client_structure else 0
-                    )
-                    first_time = serial not in _structure_sent
-                    if client_struct_ts < structure_obj.object_timestamp or first_time:
-                        _structure_sent.add(serial)
-                        outdated_objects.append(structure_obj)
-                        logger.debug(
-                            f"Including default structure bucket for unclaimed device {serial}"
-                            f"{' (first connect)' if first_time else ''}"
-                        )
+                    # See the user-bucket block above.
+                    if client_structure is None:
+                        pass
+                    else:
+                        client_struct_ts = client_structure.get("object_timestamp", 0)
+                        first_time = serial not in _structure_sent
+                        if client_struct_ts < structure_obj.object_timestamp or first_time:
+                            _structure_sent.add(serial)
+                            outdated_objects.append(structure_obj)
+                            logger.debug(
+                                f"Including default structure bucket for unclaimed device {serial}"
+                                f"{' (first connect)' if first_time else ''}"
+                            )
 
     # =========================================================================
     # Response handling - chunked vs non-chunked mode
