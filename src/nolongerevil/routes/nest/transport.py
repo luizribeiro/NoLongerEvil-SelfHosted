@@ -306,6 +306,10 @@ async def handle_transport_get(request: web.Request) -> web.Response:
     if not serial:
         return web.json_response({"error": "Serial required"}, status=400)
 
+    # A corrupted composite key bleeds into the request path too
+    # (.../device/device.SERIAL ._sync); resolve to the real serial.
+    serial = canonical_object_key(serial)
+
     state_service: DeviceStateService = request.app["state_service"]
 
     # Ensure device alert dialog exists (matches TypeScript behavior)
@@ -313,7 +317,10 @@ async def handle_transport_get(request: web.Request) -> web.Response:
 
     objects = state_service.get_objects_by_serial(serial)
 
-    # Return only metadata, not values
+    # Return only metadata, not values. The v3 firmware's nlCZGetParser faults
+    # on a "key"/"$version"/"$timestamp" shape ("parent object format incorrect
+    # … for $version" → nlclient crash-loop), so serve the same objects-array
+    # metadata shape to all firmware versions.
     response_objects = [
         {
             "object_revision": obj.object_revision,
@@ -368,6 +375,21 @@ def _contains_temperature_fields(objects: list[DeviceObject]) -> bool:
     return any(obj.value and any(field in obj.value for field in temp_fields) for obj in objects)
 
 
+def _skv_push_headers(obj: DeviceObject) -> dict[str, str]:
+    """Headers carrying a pushed bucket's identity to v3 firmware.
+
+    The v3 subscribe-response parser (ParseSKVHeaders) reads the object key,
+    version and timestamp from these headers and applies the response body as
+    the bucket's raw value. Without them it logs "bad header data" and drops
+    the push. One object per response; the body is that object's bare value.
+    """
+    return {
+        "X-nl-skv-key": obj.object_key,
+        "X-nl-skv-version": str(obj.object_revision),
+        "X-nl-skv-timestamp": str(obj.object_timestamp),
+    }
+
+
 async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse:
     """Handle POST /nest/transport - subscribe to device updates.
 
@@ -395,6 +417,9 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
 
     # Parse body supporting both formats (named fields or objects array)
     session, chunked, objects = parse_subscribe_body(body)
+    for obj in objects:
+        if obj.get("object_key"):
+            obj["object_key"] = canonical_object_key(obj["object_key"])
     if not session:
         session = f"session_{serial}_{int(time.time() * 1000)}"
     weave_device_id = extract_weave_device_id(request)
@@ -551,8 +576,20 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
 
     for i, client_obj in enumerate(processed_client_objects):
         response_obj = response_objects[i]
-        client_timestamp = client_obj.get("object_timestamp", 0)
         object_key = client_obj.get("object_key", "")
+        # v3-firmware devices subscribe without explicit revs/timestamps
+        # (`{"keys": [{"key": "..."}, ...]}`). Compare the bucket's server
+        # timestamp against the last one we pushed for this key: absent (first
+        # contact) → 0 → push (populates the device's bucket-store, else
+        # nlCZUpdateParser later rejects PUT responses with "no bucket exists
+        # for payload"); a later server-side advancement re-detects as outdated
+        # and re-pushes; otherwise the long-poll holds. v7 devices that send an
+        # explicit object_timestamp keep timestamp-authority behavior — the
+        # distinction is "field absent" vs "field present".
+        if "object_timestamp" in client_obj:
+            client_timestamp = client_obj.get("object_timestamp", 0)
+        else:
+            client_timestamp = _v3_pushed.setdefault(serial, {}).get(object_key, 0)
 
         # Use timestamp-only comparison (no revision tiebreaker)
         server_newer = _is_server_newer(
@@ -726,6 +763,13 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     # 6. On timeout: close connection without body (no tickle)
     # =========================================================================
 
+    # The X-nl-skv-* headers must be set BEFORE prepare() (headers go out there),
+    # so pick the v3 object to push now. Any remaining outdated objects — and any
+    # outdated object without a value yet — are re-detected and delivered on the
+    # device's next subscribe.
+    is_v3 = request.match_info.get("version") == "v3"
+    skv_push = next((o for o in outdated_objects if o.value), None) if is_v3 else None
+
     # Determine if we should disable defer window (pushing temp changes)
     # Must check BEFORE response.prepare() since headers are sent there
     include_disable_defer = bool(outdated_objects) and _contains_temperature_fields(
@@ -742,6 +786,8 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
     }
     if include_disable_defer:
         response_headers["X-nl-disable-defer-window"] = str(settings.disable_defer_window)
+    if skv_push is not None:
+        response_headers.update(_skv_push_headers(skv_push))
 
     response = web.StreamResponse(status=200, headers=response_headers)
 
@@ -752,8 +798,20 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
         f"(disable_defer={include_disable_defer})"
     )
 
-    # If we have outdated objects, send them immediately
-    if outdated_objects:
+    # v3 SKV push: identity is in the headers, body is the bare value.
+    if skv_push is not None:
+        logger.debug(
+            f"SKV push {skv_push.object_key} v{skv_push.object_revision} to {serial}"
+        )
+        # Record what we pushed so this bucket isn't re-pushed until it changes
+        # again (server timestamp advances past this).
+        _v3_pushed.setdefault(serial, {})[skv_push.object_key] = skv_push.object_timestamp
+        await response.write(json.dumps(skv_push.value).encode("utf-8"))
+        await response.write_eof()
+        return response
+
+    # v7 immediate push: {"objects":[...]} body.
+    if not is_v3 and outdated_objects:
         formatted_objs = [format_object_for_response(obj) for obj in outdated_objects]
         logger.debug(f"Sending {len(outdated_objects)} outdated object(s) immediately for {serial}")
         body_data = json.dumps({"objects": formatted_objs}).encode("utf-8")
@@ -790,6 +848,21 @@ async def handle_transport_subscribe(request: web.Request) -> web.StreamResponse
                 notify_queue.get(),
                 timeout=settings.connection_hold_timeout,
             )
+            if is_v3:
+                # The X-nl-skv-* headers the device needs to accept a push were
+                # already sent at prepare() and can't be added now. Tickle-close
+                # so the device resubscribes; the now-server-newer object is then
+                # delivered as an immediate SKV push on that next subscribe.
+                logger.info(
+                    f"Subscription {subscription.id}: update ready for {serial}; "
+                    "tickling for SKV re-push"
+                )
+                changed_objects = None  # discard so the except handler can't buffer it for replay
+                try:
+                    await response.write_eof()
+                except (ConnectionResetError, ConnectionError):
+                    pass
+                return response
             # Real data arrived - send it to wake the device
             body_bytes = json.dumps({"objects": changed_objects}).encode("utf-8")
             await response.write(body_bytes)
@@ -874,10 +947,15 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     except json.JSONDecodeError:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    # Parse body supporting both formats (objects array or bucket-keyed)
+    # Parse body supporting all known formats (objects array, bucket-keyed, v3 nested)
     _session, objects = parse_put_body(body)
     if not isinstance(objects, list):
         return web.Response(text="Invalid request: objects array required", status=400)
+    for obj in objects:
+        if obj.get("object_key"):
+            obj["object_key"] = canonical_object_key(obj["object_key"])
+
+    is_v3 = request.match_info.get("version") == "v3"
 
     state_service: DeviceStateService = request.app["state_service"]
 
@@ -967,17 +1045,39 @@ async def handle_transport_put(request: web.Request) -> web.Response:
         )
         await state_service.upsert_object(new_obj)
 
-        # Build response — rev/ts/key only, no value echo.
-        # The device already knows what it sent, and the subscribe channel
-        # handles server→device pushes.  Echoing the full merged bucket here
-        # caused stale target_temperature from the server's stored state to
-        # overwrite the device's schedule-derived setpoint (race between
-        # HVAC-state PUT and SetTargetTemperature on the device side).
+        # Build response — rev/ts/key only on v7, plus value-echo +
+        # $version/$timestamp on v3.
+        #
+        # On v7, echoing the full merged bucket caused stale
+        # target_temperature from the server's stored state to overwrite the
+        # device's schedule-derived setpoint (race between HVAC-state PUT
+        # and SetTargetTemperature on the device side). On v3 (firmware
+        # 4.3.3 / Display-2.14), the device-side parser doesn't apply the
+        # response at all unless `value` is present on a changed bucket,
+        # so the race the v7 omission was avoiding can't fire here.
+        #
+        # `$version` / `$timestamp` are load-bearing for v3 bootstrap. The
+        # firmware's bucket synchroniser (FUN_00069be8 in 4.3.3) literally
+        # `strstr`-searches PUT responses for those two substrings and
+        # only marks the bucket clean (IsDirty=0) when both are present
+        # and match the version/timestamp the device just PUT. Without
+        # them, every PUT keeps the bucket dirty, the subscribe Gate A
+        # (`!IsDirty()`) never opens, the device never issues a
+        # subscribe, and the bucket-store stays empty for
+        # device.<serial> / shared.<serial>. On subsequent PUTs the
+        # parser then rejects responses with "no bucket exists for
+        # payload" because the store has no entry to apply the delta to.
+        # The system can't bootstrap out of this without the echo.
         response_obj: dict[str, Any] = {
             "object_revision": new_obj.object_revision,
             "object_timestamp": new_obj.object_timestamp,
             "object_key": new_obj.object_key,
         }
+        if is_v3:
+            response_obj["$version"] = new_obj.object_revision
+            response_obj["$timestamp"] = new_obj.object_timestamp
+            if values_changed:
+                response_obj["value"] = new_obj.value
 
         response_objects.append(response_obj)
 
@@ -1002,10 +1102,69 @@ async def handle_transport_put(request: web.Request) -> web.Response:
     # path already handles pushing newer server data via timestamp comparison,
     # which is the correct mechanism.  Removed 2026-02-09.
 
+    if is_v3:
+        return web.json_response(
+            _wrap_in_v3_envelope(response_objects),
+            headers=_make_response_headers(),
+        )
     return web.json_response(
         {"objects": response_objects},
         headers=_make_response_headers(),
     )
+
+
+def _wrap_in_v3_envelope(objects: list[dict[str, Any]]) -> dict[str, Any]:
+    """Wrap PUT response objects into the v3 flat envelope.
+
+    Shape: `{"<bucket_type>.<serial>": {"_sync": {"$version": N,
+                                                   "$timestamp": T},
+                                         "value"?: {…}}, ...}`.
+
+    Top-level keys MUST be the full `<bucket_type>.<serial>` string because
+    the device's bucket-store hashtable (storage+0x980, populated at boot by
+    FUN_0003d1d4) is keyed by that exact string. nlclient looks up the
+    bucket via PL_HashTableLookup (FUN_00044814 / nlCZStorage::GetBucket) on
+    the top-level response key. A wrong top-level key misses the lookup and
+    the parser logs `"nlCZUpdateParser: no bucket exists for payload …"`,
+    leaving the bucket dirty and the subscribe gate shut forever.
+
+    `$version` and `$timestamp` are placed inside a nested `_sync` wrapper,
+    NOT as top-level fields of the per-bucket value object. The reason:
+
+    - The synchroniser (FUN_00069be8) uses raw `strstr` for the literal
+      substrings `"$version":` and `"$timestamp":` anywhere inside the
+      per-bucket value substring — nesting doesn't hide them from it. It
+      still extracts the version/timestamp and arms the subscribe gate.
+
+    - The node-walking parser (FUN_00068068) that ALSO runs on the per-bucket
+      value object dispatches per top-level child key: `$version`/`$timestamp`
+      at top level hit a switch case inside FUN_00069d30 that calls
+      FUN_0004f460, which APPENDS `" .$version"` to the bucket's composite
+      key string at bucket+0x2c. Every cycle adds another segment. The
+      corrupted key is then re-serialised verbatim into the device's next PUT
+      and subscribe bodies, producing serials like
+      `"02AA01AC2815016L .$version .$version"`. Hiding the `$`-prefixed
+      keys under a non-`$` wrapper means the node-walker only sees `_sync`
+      as a top-level field; non-`$` unknown fields go to vtable+0x2c (the
+      generic setter) and are dropped harmlessly.
+
+    See `~/nest-re/notes/answer-for-nle.md` for the full RE walkthrough.
+    """
+    envelope: dict[str, dict[str, Any]] = {}
+    for obj in objects:
+        key = obj.get("object_key", "")
+        if "." not in key:
+            continue
+        inner: dict[str, Any] = {
+            "_sync": {
+                "$version": obj.get("object_revision"),
+                "$timestamp": obj.get("object_timestamp"),
+            },
+        }
+        if "value" in obj:
+            inner["value"] = obj["value"]
+        envelope[key] = inner
+    return envelope
 
 
 def _values_equal(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
