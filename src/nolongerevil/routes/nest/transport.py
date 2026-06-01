@@ -64,6 +64,7 @@ from nolongerevil.services.device_availability import DeviceAvailability
 from nolongerevil.services.device_state_service import DeviceStateService
 from nolongerevil.services.sqlmodel_service import SQLModelService
 from nolongerevil.services.subscription_manager import SubscriptionManager
+from nolongerevil.utils.bucket_key import canonical_object_key
 from nolongerevil.utils.fan_timer import preserve_fan_timer_state
 from nolongerevil.utils.structure_assignment import assign_structure_id, derive_structure_id
 
@@ -74,6 +75,14 @@ logger = get_logger(__name__)
 # bucket even if timestamps match, because the device's internal mode may
 # have reset while the cached timestamp persists in flash.
 _structure_sent: set[str] = set()
+
+# For v3-firmware subscribes (no per-key timestamps): serial -> {object_key:
+# last_pushed_object_timestamp}. v3 subscribes carry no timestamps, so we
+# compare each bucket's current server timestamp against the last one we pushed
+# for that key: first contact (absent → 0) pushes to populate the device's
+# bucket-store; a bucket whose server timestamp later advances re-detects as
+# outdated and is re-pushed; a quiescent bucket holds the long-poll.
+_v3_pushed: dict[str, dict[str, int]] = {}
 
 # After sending the first chunk on a subscribe connection, wait this long for
 # additional data before closing.  Must be under the device's 5-second
@@ -123,7 +132,7 @@ KNOWN_BUCKET_TYPES = {
 
 
 def parse_subscribe_body(body: dict[str, Any]) -> tuple[str, bool, list[dict[str, Any]]]:
-    """Parse subscribe request body supporting both formats.
+    """Parse subscribe request body supporting all known device formats.
 
     Format 1 (named bucket fields):
     {
@@ -140,38 +149,61 @@ def parse_subscribe_body(body: dict[str, Any]) -> tuple[str, bool, list[dict[str
         "objects": [{"object_key": "device.SERIAL", ...}, ...]
     }
 
+    Format 3 (v3-style keys-only - Display-2.14 / firmware 4.3.3):
+    {
+        "keys": [{"key": "device.SERIAL"}, {"key": "shared.SERIAL"}]
+    }
+    v3 devices don't send revs/timestamps and expect long-poll semantics
+    (chunked) unconditionally.
+
     Returns:
         Tuple of (session, chunked, objects_list)
     """
     session = body.get("session", "")
     chunked = body.get("chunked", False)
 
-    # Check for objects array first
+    # Format 2: objects array
     if "objects" in body and isinstance(body["objects"], list):
         return session, chunked, body["objects"]
 
-    # Parse named bucket fields
-    objects: list[dict[str, Any]] = []
+    # Format 3: v3 keys-only
+    if "keys" in body and isinstance(body["keys"], list):
+        objects = [
+            {"object_key": entry["key"]}
+            for entry in body["keys"]
+            if isinstance(entry, dict) and isinstance(entry.get("key"), str)
+        ]
+        # v3 devices don't send chunked=true but their long-poll semantics
+        # require it; the IMMEDIATE-mode subscribe times out client-side
+        # at ~8s if we reply non-chunked.
+        return session, True, objects
+
+    # Format 1: named bucket fields
+    objects = []
     for key, value in body.items():
         if key in KNOWN_BUCKET_TYPES and isinstance(value, dict):
-            # This is a bucket field
             if "object_key" in value:
                 objects.append(value)
             else:
-                # Bucket field without object_key - skip or log
                 logger.debug(f"Bucket field '{key}' missing object_key, skipping")
 
     return session, chunked, objects
 
 
 def parse_put_body(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    """Parse PUT request body supporting both formats.
+    """Parse PUT request body supporting all known device formats.
 
     Format 1 (objects array):
     {"session": "...", "objects": [{"object_key": "...", "value": {...}}]}
 
     Format 2 (bucket-keyed - per spec):
     {"session": "...", "shared.SERIAL": {"object_key": "...", "target_temperature": 21.5}}
+
+    Format 3 (v3 nested-by-bucket-type - Display-2.14 / firmware 4.3.3):
+    {"shared": {"SERIAL": {"target_temperature": 21.5, ...}},
+     "device":  {"SERIAL": {...}}}
+    The bucket type is the outer key, the serial the inner key, and inline
+    fields become the value. object_key is reconstructed as "<type>.<serial>".
 
     In bucket-keyed format, data fields are inline with metadata (object_key,
     base_object_revision, if_object_revision). We extract inline fields into
@@ -181,27 +213,49 @@ def parse_put_body(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         Tuple of (session, objects_list)
     """
     session = body.get("session", "")
+    metadata_fields = {"object_key", "base_object_revision", "if_object_revision"}
 
-    # Check for objects array first
+    # Format 1: objects array
     if "objects" in body and isinstance(body["objects"], list):
         return session, body["objects"]
 
-    # Parse bucket-keyed format
     objects: list[dict[str, Any]] = []
-    metadata_fields = {"object_key", "base_object_revision", "if_object_revision"}
 
+    # Format 2: bucket-keyed (key contains the dot, e.g. "shared.SERIAL")
     for key, value in body.items():
         if key == "session":
             continue
-        # Keys like "shared.SERIAL" or "device.SERIAL"
         if isinstance(value, dict) and "object_key" in value:
-            # Extract inline fields into value dict (excluding metadata)
             inline_value = {k: v for k, v in value.items() if k not in metadata_fields}
             objects.append(
                 {
                     "object_key": value["object_key"],
                     "base_object_revision": value.get("base_object_revision"),
                     "if_object_revision": value.get("if_object_revision"),
+                    "value": inline_value if inline_value else None,
+                }
+            )
+
+    if objects:
+        return session, objects
+
+    # Format 3: v3 nested-by-bucket-type-then-serial
+    for bucket_type, by_serial in body.items():
+        if bucket_type == "session" or bucket_type not in KNOWN_BUCKET_TYPES:
+            continue
+        if not isinstance(by_serial, dict):
+            continue
+        for serial, bucket_value in by_serial.items():
+            if not isinstance(bucket_value, dict):
+                continue
+            inline_value = {
+                k: v for k, v in bucket_value.items() if k not in metadata_fields
+            }
+            objects.append(
+                {
+                    "object_key": f"{bucket_type}.{serial}",
+                    "base_object_revision": bucket_value.get("base_object_revision"),
+                    "if_object_revision": bucket_value.get("if_object_revision"),
                     "value": inline_value if inline_value else None,
                 }
             )
