@@ -12,6 +12,7 @@ from aiohttp import web
 from nolongerevil.config import settings
 from nolongerevil.integrations.integration_manager import IntegrationManager
 from nolongerevil.lib.logger import get_logger
+from nolongerevil.lib.tolerant_http import TolerantAppRunner
 from nolongerevil.lib.types import UserInfo
 from nolongerevil.middleware.debug_logger import create_debug_logger_middleware
 from nolongerevil.middleware.device_auth import create_device_auth_middleware
@@ -305,7 +306,10 @@ async def run_server() -> None:
     # aiohttp keepalive_timeout must exceed connection_hold_timeout so the HTTP
     # server doesn't close idle connections before our hold loop finishes.
     keepalive_timeout = int(settings.connection_hold_timeout) + 60
-    proxy_runner = web.AppRunner(proxy_app, keepalive_timeout=keepalive_timeout)
+    # The proxy serves the v3 firmware, which corrupts its BigGet request line
+    # with a raw space; TolerantAppRunner repairs it before aiohttp's parser
+    # rejects it. See lib.tolerant_http. The control API sees no device traffic.
+    proxy_runner = TolerantAppRunner(proxy_app, keepalive_timeout=keepalive_timeout)
     control_runner = web.AppRunner(control_app)
 
     await proxy_runner.setup()
